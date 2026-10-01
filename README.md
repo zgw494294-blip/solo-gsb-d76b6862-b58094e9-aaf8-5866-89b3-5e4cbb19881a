@@ -175,6 +175,154 @@ curl -s -X POST http://localhost:8080/api/review \
 
 两个输出列本身均不含敏感内容，但都因敏感连接键 `orders.uid_enc` 的行影响而阻断。
 
+## 把审查结论修订为可再次提交的安全图：`POST /api/revise`
+
+`/api/revise` 在**完全相同的图校验规则**下，尝试把被阻断的导出图修订为一张可直接再交给
+`/api/review` 且判为安全的新图。请求体在 `nodes` / `export` 之外增加一个字段：
+
+* `allowed_columns`：调用方**允许被替换**的导出列名列表，列表内列名必须**互异且存在**
+  于导出节点上（否则按整次请求错误处理：重复为 `COLUMN_CONFLICT`，不存在为
+  `INVALID_REFERENCE`，HTTP 400）。可以为空列表 `[]`，表示不允许替换任何列。
+
+修订规则（服务端不会做除此以外的任何修改）：
+
+* 原图已经安全：**原样返回** `nodes`，不新增节点，`export` 不变，`replaced_columns` 为 `[]`；
+* 否则只允许在导出节点**末尾追加一个 projection**：保持列名、列顺序与行集合不变；
+  对“值带有敏感内容来源、且在允许列表中”的列写入常量 `null`，其余列按同名 `copy` 复制；
+  **原节点一个都不改动**；
+* 出现以下任一情况则返回 `revisable: false` 及具体 `reasons`，**不返回部分改好的图**：
+  * `ROW_INFLUENCE`：导出关系存在行影响（投影/置空无法消除行影响，这是结构性不可修订）；
+  * `BLOCKED_COLUMN_NOT_ALLOWED`：仍有带敏感内容来源的阻断列不在 `allowed_columns` 中
+    （响应 `columns` 给出这些列名）；
+  * `NODE_LIMIT`：追加这一个投影后节点数会超过 60。
+
+成功响应包含完整的 `nodes`、更新后的 `export`（新投影节点 ID，形如 `revise_null_0`，
+保证不与原节点冲突）、实际被置空的列 `replaced_columns`，以及按现有规则对新图**重新审查**
+得到的 `review`（其中 `blocked` 必为 `false`）。把返回的 `nodes` 与 `export` 原样 POST 到
+`/api/review` 即可得到同样的安全结论。
+
+### 可执行的修订 → 复审调用
+
+先修订（只允许把 `mail` 一列置空）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/revise \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "nodes": [
+    {"id": "users", "type": "source",
+     "columns": [
+       {"name": "uid", "sensitive": false},
+       {"name": "email", "sensitive": true},
+       {"name": "country", "sensitive": false}]},
+    {"id": "only_cn", "type": "filter", "input": "users", "references": ["country"]},
+    {"id": "export_users", "type": "projection", "input": "only_cn",
+     "columns": [
+       {"name": "user_id", "copy": "uid"},
+       {"name": "mail", "copy": "email"},
+       {"name": "bucket", "constant": "ALL"}]}
+  ],
+  "export": "export_users",
+  "allowed_columns": ["mail"]
+}'
+```
+
+响应：
+
+```json
+{
+  "revisable": true,
+  "nodes": [
+    {"id": "users", "type": "source",
+     "columns": [
+       {"name": "uid", "sensitive": false},
+       {"name": "email", "sensitive": true},
+       {"name": "country", "sensitive": false}]},
+    {"id": "only_cn", "type": "filter", "input": "users", "references": ["country"]},
+    {"id": "export_users", "type": "projection", "input": "only_cn",
+     "columns": [
+       {"name": "user_id", "copy": "uid"},
+       {"name": "mail", "copy": "email"},
+       {"name": "bucket", "constant": "ALL"}]},
+    {"id": "revise_null_0", "type": "projection", "input": "export_users",
+     "columns": [
+       {"name": "user_id", "copy": "user_id"},
+       {"name": "mail", "constant": null},
+       {"name": "bucket", "copy": "bucket"}]}
+  ],
+  "export": "revise_null_0",
+  "replaced_columns": ["mail"],
+  "review": {
+    "export": "revise_null_0",
+    "blocked": false,
+    "columns": [
+      {"name": "user_id", "blocked": false, "content_reasons": [], "row_reasons": []},
+      {"name": "mail", "blocked": false, "content_reasons": [], "row_reasons": []},
+      {"name": "bucket", "blocked": false, "content_reasons": [], "row_reasons": []}
+    ]
+  }
+}
+```
+
+再把返回的图直接交给原审查接口复审（有 `jq` 时）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/revise \
+  -H 'Content-Type: application/json' \
+  --data @examples/revise_request.json \
+  | jq '{nodes, export}' \
+  | curl -s -X POST http://localhost:8080/api/review \
+      -H 'Content-Type: application/json' --data @-
+```
+
+没有 `jq` 时，用 Python 标准库即可（无需安装任何东西）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/revise \
+  -H 'Content-Type: application/json' \
+  --data @examples/revise_request.json -o /tmp/revised.json
+
+python3 -c 'import json,urllib.request; r=json.load(open("/tmp/revised.json")); \
+req=urllib.request.Request("http://localhost:8080/api/review", \
+data=json.dumps({"nodes": r["nodes"], "export": r["export"]}).encode(), \
+headers={"Content-Type":"application/json"}); print(urllib.request.urlopen(req).read().decode())'
+```
+
+两种方式都会打印 `"blocked": false` 的复审结果。
+
+### 不可修订示例（行影响）
+
+上面“筛选敏感列”的图即使允许替换所有列，也无法靠追加投影消除行影响：
+
+```bash
+curl -s -X POST http://localhost:8080/api/revise \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "nodes": [
+    {"id": "s", "type": "source",
+     "columns": [{"name": "id_card", "sensitive": true}, {"name": "score"}]},
+    {"id": "f", "type": "filter", "input": "s", "references": ["id_card"]},
+    {"id": "e", "type": "projection", "input": "f",
+     "columns": [{"name": "score", "copy": "score"}, {"name": "lit", "constant": 1}]}
+  ],
+  "export": "e",
+  "allowed_columns": ["score", "lit"]
+}'
+```
+
+```json
+{
+  "revisable": false,
+  "reasons": [
+    {
+      "code": "ROW_INFLUENCE",
+      "message": "the export relation is row-tainted by sensitive columns; a column projection cannot remove row-level influence",
+      "row_reasons": [{"node_id": "s", "column": "id_card"}]
+    }
+  ]
+}
+```
+
 ## 节点 JSON 结构
 
 ```jsonc
@@ -211,10 +359,10 @@ python -m pytest tests/ -q
 
 ```
 app/models.py     请求模型与结构约束（Pydantic）
-app/engine.py     图校验、拓扑排序、来源传播与逐列审查
-app/main.py       FastAPI 入口（POST /api/review，GET /health）
-examples/         请求示例
-tests/            传播规则与拒绝场景测试
+app/engine.py     图校验、拓扑排序、来源传播、逐列审查与安全修订
+app/main.py       FastAPI 入口（POST /api/review，POST /api/revise，GET /health）
+examples/         请求示例（request.json、revise_request.json）
+tests/            传播规则、拒绝场景与修订场景测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排
 ```

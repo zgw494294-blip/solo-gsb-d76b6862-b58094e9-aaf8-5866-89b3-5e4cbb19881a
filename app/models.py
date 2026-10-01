@@ -94,3 +94,13 @@ NodeIn = Annotated[
 class ReviewRequest(StrictModel):
     nodes: list[NodeIn] = Field(min_length=1, max_length=60)
     export: str = Field(min_length=1)
+
+
+class ReviseRequest(StrictModel):
+    """A review request plus the export columns the caller authorizes to be
+    replaced by a constant ``null`` (must be distinct and exist on the export).
+    """
+
+    nodes: list[NodeIn] = Field(min_length=1, max_length=60)
+    export: str = Field(min_length=1)
+    allowed_columns: list[Annotated[str, Field(min_length=1)]]

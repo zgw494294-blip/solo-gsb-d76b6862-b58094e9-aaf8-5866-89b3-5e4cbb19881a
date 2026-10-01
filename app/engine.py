@@ -22,6 +22,7 @@ from .models import (
     JoinNodeIn,
     ProjectionNodeIn,
     ReviewRequest,
+    ReviseRequest,
     SourceNodeIn,
 )
 
@@ -233,10 +234,27 @@ def _origin_view(origins: frozenset[Origin]) -> list[dict[str, str]]:
     ]
 
 
-def review(request: ReviewRequest) -> dict[str, object]:
-    # --- structural validation of the request -----------------------------
+def _column_view(column: Column, row_origins: frozenset[Origin]) -> dict[str, object]:
+    blocked = bool(column.content_origins) or bool(row_origins)
+    return {
+        "name": column.name,
+        "blocked": blocked,
+        "content_reasons": _origin_view(column.content_origins),
+        "row_reasons": _origin_view(row_origins),
+    }
+
+
+def _analyze(
+    nodes: list[object], export_id: str
+) -> tuple[dict[str, object], list[str], str, Relation]:
+    """Validate the whole graph and evaluate every node.
+
+    Runs exactly the structural validation and provenance rules of
+    ``POST /api/review`` and returns the id-indexed nodes, the topological
+    order, and the export node's relation.
+    """
     by_id: dict[str, object] = {}
-    for node in request.nodes:
+    for node in nodes:
         if node.id in by_id:
             raise ValidationError(
                 "DUPLICATE_NODE",
@@ -254,18 +272,17 @@ def review(request: ReviewRequest) -> dict[str, object]:
         elif isinstance(node, JoinNodeIn):
             _unique([o.alias for o in node.outputs], "output alias", node.id)
 
-    if request.export not in by_id:
+    if export_id not in by_id:
         raise ValidationError(
             "INVALID_REFERENCE",
-            f"export node '{request.export}' does not exist",
-            request.export,
+            f"export node '{export_id}' does not exist",
+            export_id,
         )
 
     # Validate and evaluate the whole graph: invalid references in branches
     # the export does not use still reject the whole request. At most 60 nodes.
     order = topological_order(by_id)
 
-    # --- provenance evaluation in dependency order -------------------------
     relations: dict[str, Relation] = {}
     for nid in order:
         node = by_id[nid]
@@ -280,26 +297,175 @@ def review(request: ReviewRequest) -> dict[str, object]:
                 node, relations[node.left_input], relations[node.right_input]
             )
 
+    return by_id, order, export_id, relations[export_id]
+
+
+def review(request: ReviewRequest) -> dict[str, object]:
+    _by_id, _order, export_id, export_relation = _analyze(
+        list(request.nodes), request.export
+    )
+
     # --- review every column of the export node ----------------------------
-    export_relation = relations[request.export]
-    columns_out: list[dict[str, object]] = []
-    any_blocked = False
-    for column in export_relation.columns:
-        content = column.content_origins
-        rows = export_relation.row_origins
-        blocked = bool(content) or bool(rows)
-        any_blocked = any_blocked or blocked
-        columns_out.append(
+    columns_out = [
+        _column_view(column, export_relation.row_origins)
+        for column in export_relation.columns
+    ]
+    any_blocked = any(c["blocked"] for c in columns_out)
+
+    return {
+        "export": export_id,
+        "blocked": any_blocked,
+        "columns": columns_out,
+    }
+
+
+# Prefix of the single projection node a revision is allowed to append.
+REVISE_PROJECTION_PREFIX = "revise_null_"
+
+
+def _revised_projection_id(by_id: dict[str, object]) -> str:
+    """Return a projection id that does not collide with any original node."""
+    nid = REVISE_PROJECTION_PREFIX + "0"
+    counter = 1
+    while nid in by_id:
+        nid = f"{REVISE_PROJECTION_PREFIX}{counter}"
+        counter += 1
+    return nid
+
+
+def revise(request: ReviseRequest) -> dict[str, object]:
+    nodes = list(request.nodes)
+    by_id, _order, export_id, export_relation = _analyze(nodes, request.export)
+
+    # --- validate the caller-supplied replacement allow-list ---------------
+    _unique(request.allowed_columns, "allowed replacement column", export_id)
+    export_columns = {c.name for c in export_relation.columns}
+    for name in request.allowed_columns:
+        if name not in export_columns:
+            raise ValidationError(
+                "INVALID_REFERENCE",
+                f"allowed replacement column '{name}' does not exist on export "
+                f"node '{export_id}'",
+                export_id,
+            )
+    allowed = set(request.allowed_columns)
+
+    # --- classify export columns exactly as /api/review does ---------------
+    column_views = [
+        _column_view(column, export_relation.row_origins)
+        for column in export_relation.columns
+    ]
+    any_blocked = any(c["blocked"] for c in column_views)
+
+    # An already-safe graph is returned untouched: no new node, empty
+    # replacement list, export unchanged.
+    if not any_blocked:
+        return {
+            "revisable": True,
+            "nodes": [
+                node.model_dump(by_alias=True, exclude_unset=True)
+                for node in nodes
+            ],
+            "export": export_id,
+            "replaced_columns": [],
+            "review": {"export": export_id, "blocked": False, "columns": column_views},
+        }
+
+    # --- decide whether a single appended projection can fix everything ----
+    reasons: list[dict[str, object]] = []
+
+    # A projection only rewrites column values; it can never remove row-level
+    # influence, which taints every surviving row.
+    if export_relation.row_origins:
+        reasons.append(
             {
-                "name": column.name,
-                "blocked": blocked,
-                "content_reasons": _origin_view(content),
-                "row_reasons": _origin_view(rows),
+                "code": "ROW_INFLUENCE",
+                "message": (
+                    "the export relation is row-tainted by sensitive columns; a "
+                    "column projection cannot remove row-level influence"
+                ),
+                "row_reasons": _origin_view(export_relation.row_origins),
             }
         )
 
+    # A blocked column is fixable only when its values carry sensitive content
+    # and the caller authorized replacing that exact column.
+    not_allowed = [
+        c["name"]
+        for c in column_views
+        if c["content_reasons"] and c["name"] not in allowed
+    ]
+    if not_allowed:
+        reasons.append(
+            {
+                "code": "BLOCKED_COLUMN_NOT_ALLOWED",
+                "message": (
+                    "blocked export column(s) are not in the allowed replacement "
+                    "list: " + ", ".join(not_allowed)
+                ),
+                "columns": not_allowed,
+            }
+        )
+
+    replaced = [
+        c.name
+        for c in export_relation.columns
+        if c.content_origins and c.name in allowed
+    ]
+
+    # The only permitted change is appending one projection; the resulting
+    # graph must still satisfy the 60-node cap.
+    if replaced and len(nodes) + 1 > 60:
+        reasons.append(
+            {
+                "code": "NODE_LIMIT",
+                "message": (
+                    f"appending the sanitizing projection would raise the graph "
+                    f"from {len(nodes)} to {len(nodes) + 1} nodes, exceeding the "
+                    "60-node limit"
+                ),
+            }
+        )
+
+    # Refuse wholesale: never return a partially repaired graph.
+    if reasons:
+        return {"revisable": False, "reasons": reasons}
+
+    # --- build the one appended projection ---------------------------------
+    projection_id = _revised_projection_id(by_id)
+    projection_columns: list[dict[str, object]] = []
+    for column in export_relation.columns:
+        if column.content_origins and column.name in allowed:
+            projection_columns.append({"name": column.name, "constant": None})
+        else:
+            projection_columns.append(
+                {"name": column.name, "copy": column.name}
+            )
+    sanitizer = {
+        "id": projection_id,
+        "type": "projection",
+        "input": export_id,
+        "columns": projection_columns,
+    }
+
+    revised_nodes = [
+        node.model_dump(by_alias=True, exclude_unset=True) for node in nodes
+    ] + [sanitizer]
+    revised_payload = {"nodes": revised_nodes, "export": projection_id}
+
+    # --- re-review under the exact existing rules --------------------------
+    re_review = review(ReviewRequest.model_validate(revised_payload))
+    if re_review["blocked"]:  # defensive: every reason above should prevent this
+        raise ValidationError(
+            "REVISION_FAILED",
+            "the sanitized graph is still blocked under the existing review rules",
+            projection_id,
+        )
+
     return {
-        "export": request.export,
-        "blocked": any_blocked,
-        "columns": columns_out,
+        "revisable": True,
+        "nodes": revised_nodes,
+        "export": projection_id,
+        "replaced_columns": replaced,
+        "review": re_review,
     }
