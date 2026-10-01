@@ -94,3 +94,32 @@ NodeIn = Annotated[
 class ReviewRequest(StrictModel):
     nodes: list[NodeIn] = Field(min_length=1, max_length=60)
     export: str = Field(min_length=1)
+
+
+class ReviseRequest(StrictModel):
+    """A review request plus the export columns the caller allows nulling.
+
+    The whole graph is still validated by the same rules as ``ReviewRequest``;
+    the replacement list may be empty (distinctness is then vacuous) and every
+    listed name must be non-empty. Existence of each name on the export node is
+    checked in the engine together with the rest of the graph.
+    """
+
+    nodes: list[NodeIn] = Field(min_length=1, max_length=60)
+    export: str = Field(min_length=1)
+    allowed_replacements: list[Annotated[str, Field(min_length=1)]] = Field(
+        default_factory=list
+    )
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @model_validator(mode="after")
+    def _replacement_names_distinct(self) -> "ReviseRequest":
+        seen: set[str] = set()
+        for name in self.allowed_replacements:
+            if name in seen:
+                raise ValueError(
+                    f"replacement column '{name}' is listed more than once"
+                )
+            seen.add(name)
+        return self

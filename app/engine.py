@@ -11,34 +11,53 @@ Two independent kinds of provenance are tracked for every node:
   join merges the taint of both inputs.
 
 A column of the export node is blocked when either set is non-empty.
+
+``revise`` turns a blocked graph into one that passes review by appending a
+single projection after the export node: columns carrying sensitive *content*
+may be replaced by a constant ``null`` (subject to the caller-provided allow
+list), while every other column is copied. Row-level influence cannot be
+removed that way, so such graphs are reported as not revisable.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from typing import Union
 
 from .models import (
     FilterNodeIn,
     JoinNodeIn,
     ProjectionNodeIn,
     ReviewRequest,
+    ReviseRequest,
     SourceNodeIn,
 )
+
+# Hard cap shared with the request models: a revised graph may never exceed it.
+NODE_LIMIT = 60
 
 
 class ValidationError(Exception):
     """The whole request must be rejected (HTTP 400)."""
 
-    def __init__(self, code: str, message: str, node_id: str | None = None):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        node_id: str | None = None,
+        extra: dict[str, object] | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.node_id = node_id
+        self.extra = extra or {}
 
     def detail(self) -> dict[str, object]:
         d: dict[str, object] = {"code": self.code, "message": self.message}
         if self.node_id is not None:
             d["node_id"] = self.node_id
+        d.update(self.extra)
         return d
 
 
@@ -233,10 +252,10 @@ def _origin_view(origins: frozenset[Origin]) -> list[dict[str, str]]:
     ]
 
 
-def review(request: ReviewRequest) -> dict[str, object]:
-    # --- structural validation of the request -----------------------------
+def _build_by_id(nodes: list[object]) -> dict[str, object]:
+    """Check unique node/column names and index nodes by id."""
     by_id: dict[str, object] = {}
-    for node in request.nodes:
+    for node in nodes:
         if node.id in by_id:
             raise ValidationError(
                 "DUPLICATE_NODE",
@@ -253,6 +272,18 @@ def review(request: ReviewRequest) -> dict[str, object]:
             _unique(node.references, "reference", node.id)
         elif isinstance(node, JoinNodeIn):
             _unique([o.alias for o in node.outputs], "output alias", node.id)
+    return by_id
+
+
+def _evaluate_graph(
+    request: Union[ReviewRequest, ReviseRequest],
+) -> tuple[dict[str, object], list[str], dict[str, Relation]]:
+    """Run every original validation rule and evaluate all relations.
+
+    Returns the node index, topological order and per-node relations. Raises
+    :class:`ValidationError` exactly as ``review`` always has.
+    """
+    by_id = _build_by_id(list(request.nodes))
 
     if request.export not in by_id:
         raise ValidationError(
@@ -265,7 +296,6 @@ def review(request: ReviewRequest) -> dict[str, object]:
     # the export does not use still reject the whole request. At most 60 nodes.
     order = topological_order(by_id)
 
-    # --- provenance evaluation in dependency order -------------------------
     relations: dict[str, Relation] = {}
     for nid in order:
         node = by_id[nid]
@@ -279,9 +309,14 @@ def review(request: ReviewRequest) -> dict[str, object]:
             relations[nid] = _eval_join(
                 node, relations[node.left_input], relations[node.right_input]
             )
+    return by_id, order, relations
 
-    # --- review every column of the export node ----------------------------
-    export_relation = relations[request.export]
+
+def _review_export(
+    export_id: str, relations: dict[str, Relation]
+) -> dict[str, object]:
+    """Review every column of one evaluated relation."""
+    export_relation = relations[export_id]
     columns_out: list[dict[str, object]] = []
     any_blocked = False
     for column in export_relation.columns:
@@ -299,7 +334,149 @@ def review(request: ReviewRequest) -> dict[str, object]:
         )
 
     return {
-        "export": request.export,
+        "export": export_id,
         "blocked": any_blocked,
         "columns": columns_out,
+    }
+
+
+def review(request: ReviewRequest) -> dict[str, object]:
+    _by_id, _order, relations = _evaluate_graph(request)
+    return _review_export(request.export, relations)
+
+
+def serialize_node(node: object) -> dict[str, object]:
+    """Dump a validated node back into request-compatible JSON.
+
+    ``exclude_unset`` is essential for projection columns: an unset
+    ``constant`` must not be emitted as ``null`` next to a ``copy``.
+    """
+    return node.model_dump(by_alias=True, exclude_unset=True)  # type: ignore[attr-defined]
+
+
+def _safe_projection_id(export_id: str, by_id: dict[str, object]) -> str:
+    """Pick a deterministic projection id that cannot collide with originals."""
+    base = f"{export_id}__safe_export"
+    candidate = base
+    suffix = 2
+    while candidate in by_id:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def revise(request: ReviseRequest) -> dict[str, object]:
+    """Produce a re-submittable, review-safe version of a reviewed graph.
+
+    The original graph is validated and reviewed under exactly the same rules
+    as :func:`review`. When it is already safe it is returned untouched (no new
+    node, no replaced columns). Otherwise one projection may be appended after
+    the export node; the request is rejected as not revisable (without any
+    partial graph) when row-level influence exists, a blocked column is not on
+    the allow list, or the appended node would exceed the node limit.
+    """
+    by_id, _order, relations = _evaluate_graph(request)
+    export_relation = relations[request.export]
+    export_column_names = {c.name for c in export_relation.columns}
+
+    # The allow list itself is part of the request contract: every name must
+    # resolve on the export node (distinctness is enforced by the model).
+    missing = [n for n in request.allowed_replacements if n not in export_column_names]
+    if missing:
+        raise ValidationError(
+            "REPLACEMENT_COLUMN_NOT_FOUND",
+            "allowed replacement column(s) not found on export node "
+            f"'{request.export}': " + ", ".join(missing),
+            request.export,
+            {"columns": missing},
+        )
+
+    review_result = _review_export(request.export, relations)
+    original_nodes = [serialize_node(n) for n in request.nodes]
+
+    # Already safe: return the graph as-is, nothing appended, nothing replaced.
+    if not review_result["blocked"]:
+        return {
+            "nodes": original_nodes,
+            "export": request.export,
+            "revised": False,
+            "replaced_columns": [],
+            "review": review_result,
+        }
+
+    # Row-level influence lands on every column; a trailing projection cannot
+    # remove it, so no revision is possible.
+    if export_relation.row_origins:
+        raise ValidationError(
+            "UNREVISABLE_ROW_INFLUENCE",
+            "the export relation is influenced at row level by sensitive "
+            "columns; appending a projection cannot remove row-level influence",
+            request.export,
+            {"row_reasons": _origin_view(export_relation.row_origins)},
+        )
+
+    # With no row taint every blocked column carries sensitive content; each
+    # one must be on the allow list or the revision is impossible.
+    allowed = set(request.allowed_replacements)
+    not_allowed = [
+        c.name for c in export_relation.columns if c.content_origins and c.name not in allowed
+    ]
+    if not_allowed:
+        raise ValidationError(
+            "UNREVISABLE_COLUMN_NOT_ALLOWED",
+            "blocked export column(s) are not in the allowed replacement list: "
+            + ", ".join(not_allowed),
+            request.export,
+            {"columns": not_allowed},
+        )
+
+    if len(request.nodes) + 1 > NODE_LIMIT:
+        raise ValidationError(
+            "UNREVISABLE_NODE_LIMIT",
+            f"appending the safe-export projection would exceed the "
+            f"{NODE_LIMIT}-node limit (graph already has {len(request.nodes)} "
+            "nodes)",
+            request.export,
+            {"node_count": len(request.nodes), "limit": NODE_LIMIT},
+        )
+
+    # Append exactly one projection: same column names and order, same row set;
+    # permitted content-sensitive columns become constant null, others copy.
+    projection_id = _safe_projection_id(request.export, by_id)
+    projection_columns: list[dict[str, object]] = []
+    replaced_columns: list[str] = []
+    for column in export_relation.columns:
+        if column.content_origins and column.name in allowed:
+            projection_columns.append({"name": column.name, "constant": None})
+            replaced_columns.append(column.name)
+        else:
+            projection_columns.append({"name": column.name, "copy": column.name})
+
+    new_nodes = original_nodes + [
+        {
+            "id": projection_id,
+            "type": "projection",
+            "input": request.export,
+            "columns": projection_columns,
+        }
+    ]
+
+    # Re-review the constructed graph under the original rules before returning.
+    re_review_payload = ReviewRequest.model_validate(
+        {"nodes": new_nodes, "export": projection_id}
+    )
+    re_review_result = review(re_review_payload)
+    if re_review_result["blocked"]:  # pragma: no cover - invariant by construction
+        raise ValidationError(
+            "UNREVISABLE_RESIDUAL_RISK",
+            "internal error: the revised export is still blocked",
+            projection_id,
+        )
+
+    return {
+        "nodes": new_nodes,
+        "export": projection_id,
+        "revised": True,
+        "replaced_columns": replaced_columns,
+        "review": re_review_result,
     }
